@@ -1,5 +1,8 @@
 .env
 .env.*
 *.log
+*.jar
+*.class
+/test/lib/
 /fabric-test
 /fabric-proxy
