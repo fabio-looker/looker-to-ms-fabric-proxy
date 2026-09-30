@@ -1,235 +1,295 @@
-# Microsoft Fabric DW Connectivity & Auth Proxy (Go POC)
+# Microsoft Fabric Data Warehouse Connectivity & Authentication Proxy
 
-This repository contains a proof-of-concept connectivity test script written in Go for validating connections to a **Microsoft Fabric Data Warehouse** using **Microsoft Entra ID (Active Directory) Service Principal** authentication.
-
----
-
-## 1. Is Go a Suitable Language for this?
-
-**Yes — in fact, Go is arguably one of the best languages for this use case.**
-
-### A. Direct Fabric DW Connectivity
-- Microsoft Fabric Data Warehouses and Lakehouses expose a standard **TDS (Tabular Data Stream)** protocol endpoint over port 1433 with mandatory TLS.
-- Microsoft actively maintains the official Go TDS driver: [`github.com/microsoft/go-mssqldb`](https://github.com/microsoft/go-mssqldb), which includes dedicated Azure AD / Entra ID support via its [`azuread`](https://pkg.go.dev/github.com/microsoft/go-mssqldb/azuread) package.
-- It supports `ActiveDirectoryServicePrincipal` natively, generating Entra ID access tokens for the database resource (`https://database.windows.net/.default`).
-
-### B. High-Concurrency Authentication Proxy
-For an authentication proxy sitting in front of Fabric DW, Go offers significant architectural advantages over alternatives (Python, Node.js, or Java):
-
-1. **Massive Concurrency & Low Footprint:**
-   - Go's lightweight **goroutines** start with ~2KB memory overhead (compared to ~1MB per OS thread in traditional runtimes).
-   - A single Go process can effortlessly sustain tens of thousands of concurrent client connections with predictable latency and low garbage collection overhead.
-2. **Token Caching & Entra Throttling Protection:**
-   - In high-concurrency workloads, obtaining a fresh OAuth token from Entra ID per connection or query will rapidly hit Entra ID rate limits.
-   - Using Go's [`golang.org/x/sync/singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight) and an in-memory token cache (with proactive background refresh at ~80% of TTL), thousands of concurrent incoming requests can reuse a single cached bearer token safely without race conditions or stampeding stampedes.
-3. **TDS Protocol Handling / Network Proxying:**
-   - Go's standard `net` package and `io.Copy` / `net.Conn` primitives make building TCP proxies or L7 TDS protocol interceptors straightforward and high-throughput.
-4. **Single Static Binary:**
-   - Deploys as a self-contained, statically linked binary with zero external runtime dependencies. Ideal for small container images (scratch/distroless), Kubernetes sidecars, or daemon services.
+A suite of Go and Java utilities for connecting to, proxying, and validating **Microsoft Fabric Data Warehouse** endpoints using **Microsoft Entra ID (Active Directory) Service Principal** authentication.
 
 ---
 
-## 2. Prerequisites for Microsoft Fabric
+## Architecture Overview
 
-To allow a Service Principal to connect to a Fabric Data Warehouse:
-1. **Fabric Tenant Setting:** In the Fabric Admin Portal -> *Tenant settings* -> *Developer settings*, ensure **"Service principals can use Fabric APIs"** is enabled for the security group containing your Service Principal.
-2. **Workspace Access:** Add the Service Principal (App Registration) as a **Member**, **Contributor**, or **Viewer** to the Fabric Workspace containing your warehouse.
-3. **Warehouse Permissions:** If not an admin/contributor, grant SQL permissions (e.g. `GRANT CONNECT TO [<service-principal-name>]` or `GRANT SELECT ON SCHEMA::dbo TO ...`).
+Legacy business intelligence platforms and SQL clients (such as Looker) frequently authenticate against Microsoft SQL Server databases using traditional username/password credentials over TDS (Tabular Data Stream). Microsoft Fabric Data Warehouses require OAuth2 / Entra ID Service Principal authentication with mandatory TLS.
 
----
+This repository provides three tools to bridge and validate this connection:
 
-## 3. Running the Connectivity Test Script
+1. **`fabric-test`**: CLI tool to directly test and benchmark Entra ID Service Principal connectivity to Microsoft Fabric DW.
+2. **`fabric-proxy`**: Lightweight, high-concurrency TDS protocol proxy that accepts standard SQL Server JDBC connections and translates them to Entra ID authenticated sessions on Fabric DW.
+3. **`MockLookerClient`**: Test client utilizing the official Microsoft JDBC Driver (`mssql-jdbc`) to simulate Looker's connection patterns locally.
 
-### Option A: Using Command-Line Flags
 
-```bash
-go run main.go \
-  -host "<workspace-guid>.datawarehouse.fabric.microsoft.com" \
-  -port 1433 \
-  -database "<warehouse-name>" \
-  -client-id "<azure-client-id>" \
-  -tenant-id "<azure-tenant-id>" \
-  -client-secret "<azure-client-secret>" \
-  [-table "dbo.my_table"]
+```
+┌─────────────────────────────────┐
+│     Client (Looker / JDBC)      │
+│  user: looker_user              │
+│  pass: <proxy-password>         │
+└────────────────┬────────────────┘
+                 │ TDS (Plain TCP or TLS)
+                 ▼
+┌─────────────────────────────────┐
+│          fabric-proxy           │  Authenticates incoming client credentials;
+│       (Port 14330 / TDS)        │  acquires Entra ID bearer token;
+└────────────────┬────────────────┘  relays tabular SQL queries & results.
+                 │                   TDS over TLS with Entra ID Bearer Token
+                 ▼
+┌─────────────────────────────────┐
+│    Microsoft Fabric DW / Lake   │
+│  (*.datawarehouse.fabric.       │
+│    microsoft.com:1433)          │
+└─────────────────────────────────┘
 ```
 
-### Option B: Using Environment Variables
+---
 
-You can copy `.env.example` or export the variables:
+## Prerequisites & Fabric Configuration
+
+Before using any of the tools, ensure your Azure and Fabric environments are configured:
+
+1. **Fabric Tenant Setting:** In the Microsoft Fabric Admin Portal (`Tenant settings` -> `Developer settings`), enable **"Service principals can use Fabric APIs"** for the security group containing your Service Principal.
+2. **Workspace Permissions:** Grant your Microsoft Entra Service Principal (Application ID) at least **Viewer** or **Contributor** access to the target Fabric Workspace.
+3. **SQL Permissions:** Ensure the Service Principal has permissions to read the target warehouse (e.g. `GRANT CONNECT TO [<app-name>]`).
+
+---
+
+## Configuration Reference
+
+All tools in this repository read configuration from environment variables or a local `.env` file. You can start by copying `.env.example`:
 
 ```bash
 cp .env.example .env
-# Edit .env with your credentials
-source .env
-
-go run main.go
 ```
 
-Or run the precompiled binary:
-
-```bash
-./fabric-test
-```
-
-### Script Behavior
-1. Validates all required connection parameters.
-2. Builds the secure TDS connection string with `fedauth=ActiveDirectoryServicePrincipal` and TLS encryption enforced.
-3. Pings the database to verify the TLS handshake and Entra ID Service Principal token exchange.
-4. Executes the test query:
-   - If `-table` is provided: runs `SELECT COUNT(*) FROM <table>` and reports the record count.
-   - If `-table` is omitted: runs `SELECT 1, @@VERSION` and outputs the server version.
-5. Measures and prints the duration for connection establishment and query execution.
+| Environment Variable | CLI Flag | Default | Description |
+| :--- | :--- | :--- | :--- |
+| **`FABRIC_HOST`** | `-fabric-host` / `-host` | *Required* | Fabric DW endpoint (e.g. `xxx.datawarehouse.fabric.microsoft.com`) |
+| **`FABRIC_PORT`** | `-fabric-port` / `-port` | `1433` | Fabric DW TDS port |
+| **`FABRIC_DATABASE`** | `-fabric-database` / `-database` | *Required* | Fabric database / warehouse name |
+| **`AZURE_TENANT_ID`** | `-tenant-id` | *Required* | Microsoft Entra Directory (Tenant) ID |
+| **`AZURE_CLIENT_ID`** | `-client-id` | *Required* | Microsoft Entra Application (Client) ID |
+| **`AZURE_CLIENT_SECRET`** | `-client-secret` | *Required* | Microsoft Entra Application Client Secret |
+| **`FABRIC_TABLE`** | `-table` | `""` | Optional schema.table name for record count tests, for `fabric-test` only |
+| **`PROXY_LISTEN_ADDR`** | `-listen` | `:14330` | Address and port for `fabric-proxy` to listen on |
+| **`PROXY_USER`** | `-proxy-user` | `looker_user` | Incoming username expected by `fabric-proxy` |
+| **`PROXY_PASSWORD`** | `-proxy-password` | *Required for proxy* | Incoming password expected by `fabric-proxy` |
+| **`PROXY_LOG_LEVEL`** | `-log-level` | `info` | Logging verbosity: `info` or `debug` |
+| **`PROXY_LOG_FORMAT`** | `-log-format` | `text` | Log format: `text` (human readable) or `json` (GCP Cloud Logging) |
+| **`PROXY_SLOW_QUERY_MS`**| `-slow-query-ms` | `1000` | Latency threshold (ms) to trigger slow-query warnings |
 
 ---
 
-## 4. Authentication Proxy for Looker / Legacy JDBC (`fabric-proxy`)
+## Tool 1: Connectivity Test Utility (`fabric-test`)
 
-Legacy business intelligence tools like **Looker** often only support standard SQL Server username + password authentication through standard JDBC drivers (`mssql-jdbc` or `jTDS`), and do not natively support Microsoft Entra ID (Active Directory) Service Principal tokens. Furthermore, Looker issues literal SQL text queries (`Statement.executeQuery`) rather than parameterized prepared statements.
+Directly verifies network connectivity, TLS handshake, Entra ID token acquisition, and query execution against Microsoft Fabric DW.
 
-`fabric-proxy` is a specialized TDS (Tabular Data Stream) authentication proxy designed specifically for this architecture:
+### Running with Go
 
-```
- ┌─────────────────┐       TDS (Plain/TLS)       ┌──────────────────┐      TDS (TLS + Entra ID)     ┌───────────────────────┐
- │     Looker      │ ──────────────────────────> │   fabric-proxy   │ ────────────────────────────> │  Microsoft Fabric DW  │
- │  (Legacy JDBC)  │  user: looker_user          │  (Go Proxy on    │  Service Principal Bearer Token│ (Entra Authenticated) │
- │                 │  pass: looker_secret        │   port :14330)   │  clientID@tenantID + secret   │                       │
- └─────────────────┘                             └──────────────────┘                               └───────────────────────┘
-```
-
-### How It Works:
-1. **Accepts Incoming JDBC Connections:** Listens on a local port (e.g. `:14330`).
-2. **Negotiates TDS Handshake:** Handles client `PRELOGIN` requests (supports both unencrypted local connections and TLS with dynamically generated certificates).
-3. **Authenticates Client:** Intercepts and parses the TDS `LOGIN7` packet to validate Looker's incoming username and password against `PROXY_USER` and `PROXY_PASSWORD`. Mismatched credentials receive standard TDS `18456` login failure errors.
-4. **Bridges to Microsoft Fabric:** On successful authentication, dials Fabric DW using Microsoft Entra ID Service Principal authentication via `go-mssqldb/azuread`.
-5. **Transparent Query Relaying & Logging:** Transmits literal SQL batches directly between Looker and Fabric DW, streaming tabular query results back in real time while logging executed queries for auditability.
-
-### Running the Proxy:
-
-Add the incoming credentials to your `.env` file:
 ```bash
-PROXY_LISTEN_ADDR=":14330"
-PROXY_USER="looker_user"
-PROXY_PASSWORD="looker_secret_password"
+# Using parameters from .env
+go run main.go
+
+# Or passing flags explicitly
+go run main.go \
+  -host "xxx.datawarehouse.fabric.microsoft.com" \
+  -database "my_warehouse" \
+  -client-id "00000000-0000-0000-0000-000000000000" \
+  -tenant-id "00000000-0000-0000-0000-000000000000" \
+  -client-secret "your-secret" \
+  -table "dbo.orders"
 ```
 
-Run the proxy using Go:
+### Building and Running the Binary
+
 ```bash
-go run cmd/fabric-proxy/main.go
+go build -o fabric-test main.go
+./fabric-test
 ```
 
-Or run the compiled binary:
+### Execution Steps & Output
+1. Validates configuration and verifies Entra ID credentials.
+2. Connects to Fabric DW over TLS using `fedauth=ActiveDirectoryServicePrincipal`.
+3. Queries server version (`SELECT 1, @@VERSION`).
+4. Executes `SELECT COUNT(*) FROM <table>` (if `-table` is provided).
+5. Outputs connection and execution latency metrics.
+
+---
+
+## Tool 2: Fabric Authentication Proxy (`fabric-proxy`)
+
+A high-performance daemon that intercepts incoming TDS connections from legacy JDBC/ODBC clients, verifies client credentials, dials Microsoft Fabric DW using Entra ID Service Principal authentication, and streams tabular queries and results bidirectionally.
+
+### Key Capabilities
+- **TDS Handshake & Encryption:** Supports both unencrypted local connections (`encryptNotSup`) and TLS handshakes using dynamically generated in-memory certificates.
+- **Authentication Bridge:** Translates incoming plain username/password logins into Entra ID OAuth tokens.
+- **Literal Query Streaming:** Direct L7 streaming of `packSQLBatch` packets with real-time response forwarding.
+- **Query Performance Tracking:** Tracks roundtrip latency for each SQL batch and flags slow queries.
+
+### Running Locally
+
 ```bash
+# Build the binary
+go build -o fabric-proxy ./cmd/fabric-proxy
+
+# Run the proxy
 ./fabric-proxy
 ```
 
-### Configuring Looker (JDBC Connection Settings):
+### Client Configuration (Looker / Generic JDBC)
 
-In the Looker Database Connection admin console:
+Configure the database connection in Looker or your JDBC client using the following settings:
 
 - **Dialect:** Microsoft SQL Server (2012+)
-- **Host:** `localhost` (or the IP / hostname where `fabric-proxy` is deployed)
-- **Port:** `14330`
-- **Database:** Your Fabric warehouse name (e.g. `looker-test-wh`)
+- **Host:** IP or hostname of the proxy server (e.g. `localhost` or private VM IP)
+- **Port:** `14330` (or configured `PROXY_LISTEN_ADDR`)
+- **Database:** Target Fabric warehouse name
 - **Username:** Value of `PROXY_USER` (e.g. `looker_user`)
-- **Password:** Value of `PROXY_PASSWORD` (e.g. `looker_secret_password`)
+- **Password:** Value of `PROXY_PASSWORD`
 - **Additional JDBC Parameters:**
   ```text
   encrypt=false;trustServerCertificate=true
   ```
   *(Or if using TLS to the proxy: `encrypt=true;trustServerCertificate=true`)*
 
-Full equivalent JDBC URL:
+**JDBC Connection URL:**
 ```text
-jdbc:sqlserver://localhost:14330;databaseName=your_warehouse;user=looker_user;password=looker_secret_password;encrypt=false;trustServerCertificate=true
+jdbc:sqlserver://localhost:14330;databaseName=your_warehouse;user=looker_user;password=your_password;encrypt=false;trustServerCertificate=true
+```
+
+### Observability & Logging
+
+#### Log Formats (`PROXY_LOG_FORMAT`)
+- **`text` (Default):** Human-readable output formatted for terminal and systemd journals.
+  ```text
+  2026-09-30 07:20:01 [INFO ] [10.10.0.5:54321] Authenticated user 'looker_user' (Looker). Connecting upstream to Fabric DW...
+  2026-09-30 07:20:02 [QUERY] [10.10.0.5:54321] [34.2ms] SELECT count(*) FROM orders
+  2026-09-30 07:20:05 [WARN ] [10.10.0.5:54321] [SLOW 2450.1ms] SELECT * FROM lineitem WHERE l_shipdate <= '1998-12-01'
+  2026-09-30 07:20:10 [INFO ] [10.10.0.5:54321] Session ended: duration=10.2s, queries=4, rx=1240 bytes, tx=48920 bytes (graceful close)
+  ```
+- **`json`:** Emits structured JSON compatible with Google Cloud Logging. Logs include `severity`, `time`, `client`, `query`, `duration_ms`, and `slow_query` fields for log filtering in GCP Cloud Logging.
+
+#### Dynamic Per-Connection Debug Toggle
+Debug logging can be enabled globally via `PROXY_LOG_LEVEL=debug` or dynamically on a per-connection basis without restarting the proxy:
+
+1. **Via `applicationName` parameter:** Add `applicationName=Looker-debug;` to the JDBC connection string.
+2. **Via `username` parameter:** Connect with `username=looker_user#debug` (the proxy strips the `#debug` suffix and enables verbose packet tracing for that session).
+3. **Via `databaseName` parameter:** Set database to `your_db;debug=true`.
+
+---
+
+## Production Deployment Options
+
+Because Microsoft SQL Server TDS is a stateful binary TCP protocol, deployment on Google Compute Engine (GCE), Google Kubernetes Engine (GKE), or any host supporting TCP listeners is recommended. (Cloud Run does not support the necessary raw TCP capabilities.) 
+
+### Option A: Container Deployment (Docker / Container-Optimized OS)
+
+The included multi-stage [`Dockerfile`](./Dockerfile) produces a minimal static runtime image (~15MB):
+
+```bash
+# Build container image
+docker build -t fabric-proxy:latest .
+
+# Run container with environment file
+docker run -d \
+  --name=fabric-proxy \
+  --restart=always \
+  --net=host \
+  --env-file=.env \
+  fabric-proxy:latest
+```
+
+### Option B: Systemd Daemon on Linux VM
+
+Use the provided [`fabric-proxy.service`](./fabric-proxy.service) unit file:
+
+```bash
+# 1. Copy binary and configuration to target host
+sudo mkdir -p /opt/fabric-proxy
+sudo cp fabric-proxy /opt/fabric-proxy/
+sudo cp .env /opt/fabric-proxy/
+sudo cp fabric-proxy.service /etc/systemd/system/
+
+# 2. Enable and start service
+sudo systemctl daemon-reload
+sudo systemctl enable --now fabric-proxy
+
+# 3. View live logs
+journalctl -u fabric-proxy -f
 ```
 
 ---
 
-## 5. Observability & Logging Insights
+## Tool 3: Mock Looker JDBC Client (`MockLookerClient`)
 
-The proxy provides operational metrics for monitoring, query performance analysis, and debugging.
+A Java-based test utility that loads the **official Microsoft SQL Server JDBC Driver** (`mssql-jdbc`) to simulate Looker's connection lifecycle against the proxy.
 
-### A. Google Cloud Logging & Format Toggle
-Configure `PROXY_LOG_FORMAT` in `.env`:
-- **`text` (Default for local CLI & systemd journal):**
-  ```text
-  2026-09-29 20:55:00 [INFO ] [10.128.0.5:54321] Authenticated user 'looker_user' (Looker). Connecting upstream to Fabric DW...
-  2026-09-29 20:55:01 [QUERY] [10.128.0.5:54321] [34.2ms] SELECT count(*) FROM orders
-  2026-09-29 20:55:05 [WARN ] [10.128.0.5:54321] [SLOW 2450.1ms] SELECT * FROM lineitem WHERE l_shipdate <= '1998-12-01'
-  2026-09-29 20:55:10 [INFO ] [10.128.0.5:54321] Session ended: duration=10.2s, queries=4, rx=1240 bytes, tx=48920 bytes (graceful close)
-  ```
-- **`json` (Recommended for GCP / Cloud Logging):**
-  Emits structured JSON payload lines containing `severity`, `time`, `client`, `query`, `duration_ms`, `slow_query`, and metadata. Google Cloud Logging automatically parses these fields, allowing filtering by `jsonPayload.duration_ms > 1000` or `jsonPayload.client`.
+### Purpose
+- Verifies that `fabric-proxy` correctly negotiates TDS handshakes and authenticates with standard JDBC drivers.
+- Validates metadata introspection queries (`getDatabaseProductName()`, `getDatabaseProductVersion()`).
+- Executes Looker-style literal SQL queries without requiring a live Looker deployment.
 
-### B. Dual-Level Debug Toggles
+### Running the Mock Client
 
-You can enable debug logging at the server level or dynamically on a per-connection basis:
+Ensure Java (JDK 11+) is available. A helper script [`scripts/test-mock-looker.sh`](./scripts/test-mock-looker.sh) handles driver download, compilation, and execution:
 
-1. **Global Server Toggle:**
-   Set `PROXY_LOG_LEVEL="debug"` in `.env` (or pass `-log-level=debug`).
+```bash
+# Standard test (reads credentials from .env)
+./scripts/test-mock-looker.sh
 
-2. **Dynamic Per-Connection Toggle (Zero Restart):**
-   Any client (e.g. Looker) can dynamically activate debug logs for its connection by including `debug` in its connection parameters:
-   - **Via `applicationName`:** In Looker's Additional JDBC Parameters:
-     `applicationName=Looker-debug;encrypt=false;trustServerCertificate=true`
-   - **Via `username`:** Set Looker username to `looker_user#debug` (the proxy strips the `#debug` tag and authenticates against `PROXY_USER`, but marks the connection for debug logging).
-   - **Via `databaseName`:** Set database to `looker-test-wh;debug=true`.
+# Test with dynamic debug logging enabled
+./scripts/test-mock-looker.sh --debug
 
-When debug is enabled, detailed TDS packet traces, client workstation names, and Entra ID token roundtrip timings are logged.
+# Test with client-to-proxy TLS encryption enabled
+./scripts/test-mock-looker.sh --encrypt
+```
 
-### C. Slow Query Detection
-Set `PROXY_SLOW_QUERY_MS=1000` (default 1000ms). Any query whose execution on Fabric DW exceeds this threshold is flagged with `WARNING` severity.
+### Sample Output
+
+```text
+================================================================
+  Mock Looker JDBC Client (Official Microsoft JDBC Driver)
+================================================================
+
+[1/4] Connecting via JDBC:
+      URL: jdbc:sqlserver://localhost:14330;databaseName=looker-test-wh;user=looker_user;password=********;encrypt=false;trustServerCertificate=true;applicationName=Looker;
+      Client Application Name: Looker
+      TLS Encryption to Proxy: Disabled (Plain TCP)
+[2/4] Successfully connected to proxy in 648 ms!
+
+[3/4] Connection Metadata (from Fabric DW via Proxy):
+      Database Product: Microsoft SQL Azure
+      Database Version: 12.0.2000.8
+      Driver Name:      Microsoft JDBC Driver 12.8 for SQL Server
+      Driver Version:   12.8.1.0
+
+[4/4] Executing Looker-style literal SQL queries...
+
+--- Executing SQL: SELECT 1 AS looker_test_val, 'Fabric Proxy Connected' AS status;
+    looker_test_val | status
+    ------------------------
+    1 | Fabric Proxy Connected
+    (1 row(s) returned in 24 ms)
+
+================================================================
+  All Mock Looker queries executed successfully!
+================================================================
+```
 
 ---
 
-## 6. Deployment on Google Compute Engine (GCE)
+## Repository Structure
 
-Because SQL Server TDS is a stateful binary TCP protocol (not HTTP), deploying to a **Google Compute Engine (GCE)** VM or GKE is the recommended pattern on Google Cloud. A micro/small VM (`e2-micro` or `e2-small`) easily handles high concurrency with sub-millisecond overhead.
-
-### Option A: Direct VM Deployment with Systemd
-
-1. Create an `e2-micro` or `e2-small` Debian/Ubuntu VM on GCE:
-   ```bash
-   gcloud compute instances create fabric-proxy-vm \
-       --zone=us-central1-a \
-       --machine-type=e2-small \
-       --tags=fabric-proxy
-   ```
-2. Allow incoming traffic on port 14330 from your Looker instance / VPC:
-   ```bash
-   gcloud compute firewall-rules create allow-fabric-proxy \
-       --allow=tcp:14330 \
-       --target-tags=fabric-proxy \
-       --source-ranges=<LOOKER_IP_OR_VPC_CIDR>
-   ```
-3. Copy `fabric-proxy`, `.env`, and `fabric-proxy.service` to the VM:
-   ```bash
-   ssh fabric-proxy-vm "sudo mkdir -p /opt/fabric-proxy"
-   scp fabric-proxy .env fabric-proxy-vm:/opt/fabric-proxy/
-   scp fabric-proxy.service fabric-proxy-vm:/etc/systemd/system/
-   ```
-4. Enable and start the systemd service:
-   ```bash
-   ssh fabric-proxy-vm "sudo systemctl daemon-reload && sudo systemctl enable --now fabric-proxy"
-   ```
-5. View live logs:
-   ```bash
-   ssh fabric-proxy-vm "journalctl -u fabric-proxy -f"
-   ```
-
-### Option B: Docker Container Deployment (Container-Optimized OS)
-
-1. Build and push the container image to Google Artifact Registry:
-   ```bash
-   docker build -t us-central1-docker.pkg.dev/<PROJECT_ID>/images/fabric-proxy:latest .
-   docker push us-central1-docker.pkg.dev/<PROJECT_ID>/images/fabric-proxy:latest
-   ```
-2. Run on GCE Container-Optimized OS:
-   ```bash
-   gcloud compute instances create-with-container fabric-proxy-cos \
-       --zone=us-central1-a \
-       --machine-type=e2-small \
-       --container-image=us-central1-docker.pkg.dev/<PROJECT_ID>/images/fabric-proxy:latest \
-       --container-env-file=.env \
-       --tags=fabric-proxy
-   ```
+```text
+├── cmd/
+│   └── fabric-proxy/
+│       └── main.go                 # TDS proxy daemon source code
+├── scripts/
+│   └── test-mock-looker.sh         # Mock Looker test runner script
+├── test/
+│   └── MockLookerClient.java       # Mock Looker JDBC client using mssql-jdbc
+├── .dockerignore                   # Build context exclusions
+├── .env.example                    # Configuration template
+├── .gcloudignore                   # Cloud Build upload exclusions
+├── .gitignore                      # Git ignored files (binaries, secrets, jars)
+├── Dockerfile                      # Multi-stage production container build
+├── fabric-proxy.service            # Systemd service unit file
+├── go.mod                          # Go module dependencies
+├── go.sum                          # Go checksums
+├── main.go                         # Fabric connectivity test utility (fabric-test)
+└── README.md                       # Documentation
+```
