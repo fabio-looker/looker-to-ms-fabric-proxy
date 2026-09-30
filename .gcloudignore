@@ -1,5 +1,8 @@
+.git
+.gcloudignore
+.dockerignore
 .env
 .env.*
-*.log
 /fabric-test
 /fabric-proxy
+*.log

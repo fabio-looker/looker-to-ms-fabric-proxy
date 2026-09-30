@@ -142,3 +142,94 @@ Full equivalent JDBC URL:
 ```text
 jdbc:sqlserver://localhost:14330;databaseName=your_warehouse;user=looker_user;password=looker_secret_password;encrypt=false;trustServerCertificate=true
 ```
+
+---
+
+## 5. Observability & Logging Insights
+
+The proxy provides operational metrics for monitoring, query performance analysis, and debugging.
+
+### A. Google Cloud Logging & Format Toggle
+Configure `PROXY_LOG_FORMAT` in `.env`:
+- **`text` (Default for local CLI & systemd journal):**
+  ```text
+  2026-09-29 20:55:00 [INFO ] [10.128.0.5:54321] Authenticated user 'looker_user' (Looker). Connecting upstream to Fabric DW...
+  2026-09-29 20:55:01 [QUERY] [10.128.0.5:54321] [34.2ms] SELECT count(*) FROM orders
+  2026-09-29 20:55:05 [WARN ] [10.128.0.5:54321] [SLOW 2450.1ms] SELECT * FROM lineitem WHERE l_shipdate <= '1998-12-01'
+  2026-09-29 20:55:10 [INFO ] [10.128.0.5:54321] Session ended: duration=10.2s, queries=4, rx=1240 bytes, tx=48920 bytes (graceful close)
+  ```
+- **`json` (Recommended for GCP / Cloud Logging):**
+  Emits structured JSON payload lines containing `severity`, `time`, `client`, `query`, `duration_ms`, `slow_query`, and metadata. Google Cloud Logging automatically parses these fields, allowing filtering by `jsonPayload.duration_ms > 1000` or `jsonPayload.client`.
+
+### B. Dual-Level Debug Toggles
+
+You can enable debug logging at the server level or dynamically on a per-connection basis:
+
+1. **Global Server Toggle:**
+   Set `PROXY_LOG_LEVEL="debug"` in `.env` (or pass `-log-level=debug`).
+
+2. **Dynamic Per-Connection Toggle (Zero Restart):**
+   Any client (e.g. Looker) can dynamically activate debug logs for its connection by including `debug` in its connection parameters:
+   - **Via `applicationName`:** In Looker's Additional JDBC Parameters:
+     `applicationName=Looker-debug;encrypt=false;trustServerCertificate=true`
+   - **Via `username`:** Set Looker username to `looker_user#debug` (the proxy strips the `#debug` tag and authenticates against `PROXY_USER`, but marks the connection for debug logging).
+   - **Via `databaseName`:** Set database to `looker-test-wh;debug=true`.
+
+When debug is enabled, detailed TDS packet traces, client workstation names, and Entra ID token roundtrip timings are logged.
+
+### C. Slow Query Detection
+Set `PROXY_SLOW_QUERY_MS=1000` (default 1000ms). Any query whose execution on Fabric DW exceeds this threshold is flagged with `WARNING` severity.
+
+---
+
+## 6. Deployment on Google Compute Engine (GCE)
+
+Because SQL Server TDS is a stateful binary TCP protocol (not HTTP), deploying to a **Google Compute Engine (GCE)** VM or GKE is the recommended pattern on Google Cloud. A micro/small VM (`e2-micro` or `e2-small`) easily handles high concurrency with sub-millisecond overhead.
+
+### Option A: Direct VM Deployment with Systemd
+
+1. Create an `e2-micro` or `e2-small` Debian/Ubuntu VM on GCE:
+   ```bash
+   gcloud compute instances create fabric-proxy-vm \
+       --zone=us-central1-a \
+       --machine-type=e2-small \
+       --tags=fabric-proxy
+   ```
+2. Allow incoming traffic on port 14330 from your Looker instance / VPC:
+   ```bash
+   gcloud compute firewall-rules create allow-fabric-proxy \
+       --allow=tcp:14330 \
+       --target-tags=fabric-proxy \
+       --source-ranges=<LOOKER_IP_OR_VPC_CIDR>
+   ```
+3. Copy `fabric-proxy`, `.env`, and `fabric-proxy.service` to the VM:
+   ```bash
+   ssh fabric-proxy-vm "sudo mkdir -p /opt/fabric-proxy"
+   scp fabric-proxy .env fabric-proxy-vm:/opt/fabric-proxy/
+   scp fabric-proxy.service fabric-proxy-vm:/etc/systemd/system/
+   ```
+4. Enable and start the systemd service:
+   ```bash
+   ssh fabric-proxy-vm "sudo systemctl daemon-reload && sudo systemctl enable --now fabric-proxy"
+   ```
+5. View live logs:
+   ```bash
+   ssh fabric-proxy-vm "journalctl -u fabric-proxy -f"
+   ```
+
+### Option B: Docker Container Deployment (Container-Optimized OS)
+
+1. Build and push the container image to Google Artifact Registry:
+   ```bash
+   docker build -t us-central1-docker.pkg.dev/<PROJECT_ID>/images/fabric-proxy:latest .
+   docker push us-central1-docker.pkg.dev/<PROJECT_ID>/images/fabric-proxy:latest
+   ```
+2. Run on GCE Container-Optimized OS:
+   ```bash
+   gcloud compute instances create-with-container fabric-proxy-cos \
+       --zone=us-central1-a \
+       --machine-type=e2-small \
+       --container-image=us-central1-docker.pkg.dev/<PROJECT_ID>/images/fabric-proxy:latest \
+       --container-env-file=.env \
+       --tags=fabric-proxy
+   ```

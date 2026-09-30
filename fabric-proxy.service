@@ -1,0 +1,17 @@
+[Unit]
+Description=Microsoft Fabric Data Warehouse TDS Authentication Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/fabric-proxy
+ExecStart=/opt/fabric-proxy/fabric-proxy
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
