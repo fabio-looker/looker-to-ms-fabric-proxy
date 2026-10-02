@@ -6,14 +6,15 @@ A suite of Go and Java utilities for connecting to, proxying, and validating **M
 
 ## Architecture Overview
 
-Legacy business intelligence platforms and SQL clients (such as Looker) frequently authenticate against Microsoft SQL Server databases using traditional username/password credentials over TDS (Tabular Data Stream). Microsoft Fabric Data Warehouses require OAuth2 / Entra ID Service Principal authentication with mandatory TLS.
+Looker currently supports authenticating against Microsoft SQL Server databases primarily using traditional username/password credentials over TDS (Tabular Data Stream). Microsoft Fabric Data Warehouses require OAuth2 / Entra ID Service Principal authentication with mandatory TLS.
 
 This repository provides three tools to bridge and validate this connection:
 
-1. **`fabric-test`**: CLI tool to directly test and benchmark Entra ID Service Principal connectivity to Microsoft Fabric DW.
+1. **`fabric-test`**: CLI tool to directly test and validate Entra ID Service Principal connectivity to Microsoft Fabric DW.
 2. **`fabric-proxy`**: Lightweight, high-concurrency TDS protocol proxy that accepts standard SQL Server JDBC connections and translates them to Entra ID authenticated sessions on Fabric DW.
 3. **`MockLookerClient`**: Test client utilizing the official Microsoft JDBC Driver (`mssql-jdbc`) to simulate Looker's connection patterns locally.
 
+## Architecture diagram for fabric-proxy
 
 ```
 ┌─────────────────────────────────┐
@@ -25,7 +26,7 @@ This repository provides three tools to bridge and validate this connection:
                  ▼
 ┌─────────────────────────────────┐
 │          fabric-proxy           │  Authenticates incoming client credentials;
-│       (Port 14330 / TDS)        │  acquires Entra ID bearer token;
+│          (Port 14330)           │  acquires Entra ID bearer token;
 └────────────────┬────────────────┘  relays tabular SQL queries & results.
                  │                   TDS over TLS with Entra ID Bearer Token
                  ▼
@@ -82,10 +83,10 @@ Directly verifies network connectivity, TLS handshake, Entra ID token acquisitio
 
 ```bash
 # Using parameters from .env
-go run main.go
+go run ./cmd/fabric-test
 
 # Or passing flags explicitly
-go run main.go \
+go run ./cmd/fabric-test \
   -host "xxx.datawarehouse.fabric.microsoft.com" \
   -database "my_warehouse" \
   -client-id "00000000-0000-0000-0000-000000000000" \
@@ -97,7 +98,7 @@ go run main.go \
 ### Building and Running the Binary
 
 ```bash
-go build -o fabric-test main.go
+go build -o fabric-test ./cmd/fabric-test
 ./fabric-test
 ```
 
@@ -221,7 +222,7 @@ A Java-based test utility that loads the **official Microsoft SQL Server JDBC Dr
 ### Purpose
 - Verifies that `fabric-proxy` correctly negotiates TDS handshakes and authenticates with standard JDBC drivers.
 - Validates metadata introspection queries (`getDatabaseProductName()`, `getDatabaseProductVersion()`).
-- Executes Looker-style literal SQL queries without requiring a live Looker deployment.
+- Tests SQL queries without requiring a live Looker deployment.
 
 ### Running the Mock Client
 
@@ -276,8 +277,10 @@ Ensure Java (JDK 11+) is available. A helper script [`scripts/test-mock-looker.s
 
 ```text
 ├── cmd/
-│   └── fabric-proxy/
-│       └── main.go                 # TDS proxy daemon source code
+│   ├── fabric-proxy/
+│   │   └── main.go                 # TDS proxy daemon source code
+│   └── fabric-test/
+│       └── main.go                 # Fabric connectivity test utility
 ├── scripts/
 │   └── test-mock-looker.sh         # Mock Looker test runner script
 ├── test/
@@ -290,6 +293,5 @@ Ensure Java (JDK 11+) is available. A helper script [`scripts/test-mock-looker.s
 ├── fabric-proxy.service            # Systemd service unit file
 ├── go.mod                          # Go module dependencies
 ├── go.sum                          # Go checksums
-├── main.go                         # Fabric connectivity test utility (fabric-test)
 └── README.md                       # Documentation
 ```
